@@ -67,6 +67,7 @@
 #include "tree.h"
 #include "boxes.h"  // sort_box(), tree_box()
 #include "layout.h"
+#include "panel.h"
 #include "cmd.h"  // commands
 #include "hotlist.h"
 #include "panelize.h"
@@ -265,6 +266,7 @@ create_command_menu (void)
     entries =
         g_list_prepend (entries, menu_entry_new (_ ("E&xternal panelize"), CK_ExternalPanelize));
     entries = g_list_prepend (entries, menu_entry_new (_ ("Show directory s&izes"), CK_DirSize));
+    entries = g_list_prepend (entries, menu_entry_new (_ ("Toggle &preview"), CK_TogglePreview));
     entries = g_list_prepend (entries, menu_separator_new ());
     entries = g_list_prepend (entries, menu_entry_new (_ ("Command &history"), CK_History));
     entries = g_list_prepend (
@@ -1308,6 +1310,9 @@ midnight_execute_cmd (Widget *sender, long command)
         break;
     case CK_DirSize:
         smart_dirsize_cmd (current_panel);
+        break;
+    case CK_TogglePreview:
+        preview_toggle ();
         break;
     case CK_Sort:
         sort_cmd ();

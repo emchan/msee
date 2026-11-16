@@ -38,6 +38,7 @@
 
 #include "lib/global.h"
 #include "lib/hook.h"
+#include <stdio.h>
 
 /*** global variables ****************************************************************************/
 

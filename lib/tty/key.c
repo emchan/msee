@@ -58,6 +58,8 @@
 #include "key.h"
 
 #include "lib/widget.h"  // mc_refresh()
+#include "lib/widget/dialog-switch.h"  // mc_refresh()
+#include "src/filemanager/panel.h"  // preview_is_animating()
 
 #ifdef HAVE_TEXTMODE_X11_SUPPORT
 #include "x11conn.h"
@@ -1970,6 +1972,13 @@ tty_get_event (struct Gpm_Event *event, gboolean redo_event, gboolean block)
                 time_out.tv_usec = 0;
                 time_addr = &time_out;
             }
+
+            if (preview_is_animating ())
+            {
+                time_out.tv_sec = 0;
+                time_out.tv_usec = 333333;
+                time_addr = &time_out;
+            }
         }
 
         if (!block || tty_got_winch ())
@@ -1994,6 +2003,11 @@ tty_get_event (struct Gpm_Event *event, gboolean redo_event, gboolean block)
                 return EV_MOUSE;
             if (!block || tty_got_winch ())
                 return EV_NONE;
+            if (preview_is_animating ())
+            {
+                mc_refresh ();
+                return EV_NONE;
+            }
             vfs_timeout_handler ();
         }
         if (flag == -1 && errno == EINTR)

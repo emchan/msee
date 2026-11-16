@@ -32,14 +32,21 @@
 
 #include <config.h>
 
+#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>  // UINT_MAX
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <glib/gstdio.h>
 
 #include "lib/global.h"
 
 #include "lib/tty/tty.h"
+#include <slang.h>
+#include <math.h>
 #include "lib/tty/key.h"  // XCTRL and ALT macros
 #include "lib/skin.h"
 #include "lib/strutil.h"
@@ -50,6 +57,9 @@
 #include "lib/timefmt.h"  // file_date()
 #include "lib/util.h"
 #include "lib/widget.h"
+#include "lib/widget/dialog-switch.h"
+#include "lib/hook.h"
+#include "lib/widget/dialog.h"
 #include "lib/charsets.h"  // get_codepage_id ()
 #include "lib/event.h"
 
@@ -3753,6 +3763,1048 @@ panel_key (WPanel *panel, int key)
 }
 
 /* --------------------------------------------------------------------------------------------- */
+/*** preview support *****************************************************************************/
+/* --------------------------------------------------------------------------------------------- */
+
+static char *preview_cached_path = NULL;
+static char *preview_cached_data = NULL;
+static int preview_cached_kind = 0;  // 0 none, 1 image, 2 text
+static int preview_cached_lines = 0;
+static int preview_cached_width = 0;
+static int preview_cached_height = 0;
+
+gboolean preview_enabled = TRUE;
+
+static gboolean preview_animating = FALSE;
+static gboolean preview_overlay_active = FALSE;
+static gint64 preview_last_frame_time = 0;
+static double preview_video_duration = 0.0;
+static double preview_video_current_ts = 0.0;
+
+#define PREVIEW_VIDEO_FPS 3.0
+#define PREVIEW_VIDEO_SPEED 5.0
+#define PREVIEW_VIDEO_BAR_MIN 12
+
+static FILE *preview_video_stream = NULL;
+static int preview_video_stream_w = 0;
+static int preview_video_stream_h = 0;
+static int preview_video_stream_frame_bytes = 0;
+static guint64 preview_video_stream_frames = 0;
+static gboolean preview_video_stream_failed = FALSE;
+static int preview_video_frame_fd = -1;
+static guchar *preview_video_frame_buf = NULL;
+static char *preview_video_frame_path = NULL;
+static char *preview_video_duration_path = NULL;
+
+static gboolean
+terminal_supports_sixel (void)
+{
+    const char *term = getenv ("TERM");
+    const char *wt = getenv ("WT_SESSION");
+    const char *tmux = getenv ("TMUX");
+
+    // tmux does not reliably support sixel graphics
+    if (tmux != NULL && tmux[0] != '\0')
+        return FALSE;
+    if (term != NULL && (strstr (term, "screen") != NULL || strstr (term, "tmux") != NULL))
+        return FALSE;
+
+    if (wt != NULL && wt[0] != '\0')
+        return TRUE;
+    if (term != NULL && (strstr (term, "sixel") != NULL || strstr (term, "mlterm") != NULL
+                         || strstr (term, "foot") != NULL))
+        return TRUE;
+    return FALSE;
+}
+
+/* Pixel size of one terminal cell. Falls back to an 8x16 cell when the
+ * terminal does not report its pixel dimensions (common with PTYs). */
+static void
+preview_cell_pixels (int *cell_w, int *cell_h)
+{
+    *cell_w = 8;
+    *cell_h = 16;
+
+#ifdef TIOCGWINSZ
+    {
+        struct winsize ws;
+
+        if (ioctl (STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0
+            && ws.ws_xpixel > 0 && ws.ws_ypixel > 0)
+        {
+            int w = ws.ws_xpixel / ws.ws_col;
+            int h = ws.ws_ypixel / ws.ws_row;
+
+            if (w > 0 && h > 0)
+            {
+                *cell_w = w;
+                *cell_h = h;
+            }
+        }
+    }
+#endif
+}
+
+static gboolean
+preview_is_image (const char *path)
+{
+    const char *ext = strrchr (path, '.');
+    if (ext == NULL)
+        return FALSE;
+    ext++;
+    return (g_ascii_strcasecmp (ext, "png") == 0 || g_ascii_strcasecmp (ext, "jpg") == 0
+            || g_ascii_strcasecmp (ext, "jpeg") == 0 || g_ascii_strcasecmp (ext, "gif") == 0
+            || g_ascii_strcasecmp (ext, "bmp") == 0 || g_ascii_strcasecmp (ext, "webp") == 0
+            || g_ascii_strcasecmp (ext, "tiff") == 0 || g_ascii_strcasecmp (ext, "tif") == 0
+            || g_ascii_strcasecmp (ext, "xpm") == 0 || g_ascii_strcasecmp (ext, "ppm") == 0
+            || g_ascii_strcasecmp (ext, "pgm") == 0 || g_ascii_strcasecmp (ext, "pbm") == 0
+            || g_ascii_strcasecmp (ext, "heic") == 0 || g_ascii_strcasecmp (ext, "heif") == 0
+            || g_ascii_strcasecmp (ext, "avif") == 0);
+}
+
+static gboolean
+preview_is_audio (const char *path)
+{
+    const char *ext = strrchr (path, '.');
+    if (ext == NULL)
+        return FALSE;
+    ext++;
+    return (g_ascii_strcasecmp (ext, "mp3") == 0 || g_ascii_strcasecmp (ext, "m4a") == 0
+            || g_ascii_strcasecmp (ext, "flac") == 0 || g_ascii_strcasecmp (ext, "ogg") == 0
+            || g_ascii_strcasecmp (ext, "wav") == 0 || g_ascii_strcasecmp (ext, "aac") == 0);
+}
+
+static gboolean
+preview_is_video (const char *path)
+{
+    const char *ext = strrchr (path, '.');
+    if (ext == NULL)
+        return FALSE;
+    ext++;
+    return (g_ascii_strcasecmp (ext, "mp4") == 0 || g_ascii_strcasecmp (ext, "mov") == 0
+            || g_ascii_strcasecmp (ext, "mkv") == 0 || g_ascii_strcasecmp (ext, "avi") == 0
+            || g_ascii_strcasecmp (ext, "webm") == 0 || g_ascii_strcasecmp (ext, "m4v") == 0);
+}
+
+static gboolean preview_is_document (const char *path);
+
+static gboolean
+preview_is_supported (const char *path)
+{
+    const char *ext = strrchr (path, '.');
+    char extbuf[16];
+
+    if (ext == NULL)
+        return FALSE;
+    ext++;
+    g_strlcpy (extbuf, ext, sizeof (extbuf));
+
+    if (preview_is_image (path))
+        return TRUE;
+    if (preview_is_video (path))
+        return TRUE;
+    if (preview_is_audio (path))
+        return TRUE;
+    if (g_ascii_strcasecmp (extbuf, "zip") == 0)
+        return TRUE;
+    if (g_ascii_strcasecmp (extbuf, "pdf") == 0)
+        return TRUE;
+    if (g_ascii_strcasecmp (extbuf, "html") == 0 || g_ascii_strcasecmp (extbuf, "htm") == 0)
+        return TRUE;
+    if (preview_is_document (path))
+        return TRUE;
+    return FALSE;
+}
+
+static gboolean
+preview_is_document (const char *path)
+{
+    const char *ext = strrchr (path, '.');
+    if (ext == NULL)
+        return FALSE;
+    ext++;
+    return (g_ascii_strcasecmp (ext, "pdf") == 0 || g_ascii_strcasecmp (ext, "txt") == 0
+            || g_ascii_strcasecmp (ext, "md") == 0 || g_ascii_strcasecmp (ext, "c") == 0
+            || g_ascii_strcasecmp (ext, "h") == 0 || g_ascii_strcasecmp (ext, "cpp") == 0
+            || g_ascii_strcasecmp (ext, "py") == 0 || g_ascii_strcasecmp (ext, "sh") == 0
+            || g_ascii_strcasecmp (ext, "json") == 0 || g_ascii_strcasecmp (ext, "xml") == 0
+            || g_ascii_strcasecmp (ext, "html") == 0 || g_ascii_strcasecmp (ext, "htm") == 0
+            || g_ascii_strcasecmp (ext, "log") == 0);
+}
+
+static gboolean
+preview_has (const char *name)
+{
+    gchar *path = g_find_program_in_path (name);
+    if (path != NULL)
+    {
+        g_free (path);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static char *
+preview_run_command (const char *cmd)
+{
+    FILE *fp;
+    GString *out;
+    char buf[4096];
+    size_t n;
+
+    fp = popen (cmd, "r");
+    if (fp == NULL)
+        return NULL;
+
+    out = g_string_new ("");
+    while ((n = fread (buf, 1, sizeof (buf), fp)) > 0)
+        g_string_append_len (out, buf, n);
+    pclose (fp);
+
+    // strip leading/trailing newlines to avoid scrolling the terminal
+    while (out->len > 0 && (out->str[0] == '\n' || out->str[0] == '\r'))
+        g_string_erase (out, 0, 1);
+    while (out->len > 0 && (out->str[out->len - 1] == '\n' || out->str[out->len - 1] == '\r'))
+        g_string_truncate (out, out->len - 1);
+
+    return g_string_free (out, FALSE);
+}
+
+static char *
+preview_run_argv (char **argv)
+{
+    GError *error = NULL;
+    gchar *out = NULL;
+    gint status = 0;
+    GString *result;
+
+    if (!g_spawn_sync (NULL, argv, NULL,
+                       G_SPAWN_SEARCH_PATH | G_SPAWN_STDERR_TO_DEV_NULL
+                           | G_SPAWN_LEAVE_DESCRIPTORS_OPEN,
+                       NULL, NULL, &out, NULL, &status, &error))
+    {
+        g_clear_error (&error);
+        return NULL;
+    }
+
+    result = g_string_new (out != NULL ? out : "");
+    g_free (out);
+    g_string_append (result, "\033[?25h");
+    return g_string_free (result, FALSE);
+}
+
+static gboolean
+preview_video_frame_write (const guchar *data, size_t len)
+{
+    size_t off = 0;
+
+    if (preview_video_frame_fd < 0)
+        return FALSE;
+
+    while (off < len)
+    {
+        ssize_t n = pwrite (preview_video_frame_fd, data + off, len - off, (off_t) off);
+
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return FALSE;
+        }
+        if (n == 0)
+            return FALSE;
+        off += (size_t) n;
+    }
+
+    return ftruncate (preview_video_frame_fd, (off_t) len) == 0;
+}
+
+static void
+preview_video_stream_stop (void)
+{
+    if (preview_video_stream != NULL)
+    {
+        pclose (preview_video_stream);
+        preview_video_stream = NULL;
+    }
+
+    if (preview_video_frame_fd >= 0)
+    {
+        close (preview_video_frame_fd);
+        preview_video_frame_fd = -1;
+    }
+
+    if (preview_video_frame_path != NULL)
+    {
+        g_unlink (preview_video_frame_path);
+        g_free (preview_video_frame_path);
+        preview_video_frame_path = NULL;
+    }
+
+    g_free (preview_video_frame_buf);
+    preview_video_frame_buf = NULL;
+
+    preview_video_stream_w = 0;
+    preview_video_stream_h = 0;
+    preview_video_stream_frame_bytes = 0;
+    preview_video_stream_frames = 0;
+}
+
+static void
+preview_video_stream_start (const char *path, int px_w, int px_h, double start_ts)
+{
+    char *quoted;
+    char cmd[8192];
+    char *tmpl;
+    int fd;
+
+    preview_video_stream_stop ();
+    if (px_w <= 0 || px_h <= 0)
+        return;
+
+    quoted = g_shell_quote (path);
+    g_snprintf (cmd, sizeof (cmd),
+                "ffmpeg -nostdin -loglevel error -ss %f -stream_loop -1 -threads 1 -i %s "
+                "-an -sn -dn -sws_flags fast_bilinear "
+                "-vf \"setpts=%f*PTS,fps=%f,scale=%d:%d:force_original_aspect_ratio=decrease:flags=fast_bilinear,"
+                "pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black\" "
+                "-f rawvideo -pix_fmt rgb24 - 2>/dev/null",
+                start_ts, quoted, 1.0 / PREVIEW_VIDEO_SPEED, PREVIEW_VIDEO_FPS, px_w, px_h, px_w, px_h);
+    g_free (quoted);
+
+    preview_video_stream = popen (cmd, "r");
+    if (preview_video_stream == NULL)
+        return;
+
+    preview_video_stream_w = px_w;
+    preview_video_stream_h = px_h;
+    preview_video_stream_frame_bytes = px_w * px_h * 3;
+    preview_video_stream_frames =
+        (guint64) (start_ts * PREVIEW_VIDEO_FPS / PREVIEW_VIDEO_SPEED);
+
+    if (g_file_test ("/dev/shm", G_FILE_TEST_IS_DIR) && access ("/dev/shm", W_OK) == 0)
+        tmpl = g_strdup_printf ("/dev/shm/msee-frame-XXXXXX");
+    else
+        tmpl = g_strdup_printf ("%s/msee-frame-XXXXXX", mc_tmpdir ());
+
+    fd = g_mkstemp (tmpl);
+    if (fd >= 0)
+    {
+        int flags = fcntl (fd, F_GETFD);
+
+        if (flags >= 0)
+            fcntl (fd, F_SETFD, flags & ~FD_CLOEXEC);
+
+        preview_video_frame_fd = fd;
+        preview_video_frame_buf = g_malloc (preview_video_stream_frame_bytes);
+
+        if (g_file_test ("/proc/self/fd", G_FILE_TEST_IS_DIR))
+        {
+            // anonymous shared-memory file: disappears when the fd is closed
+            g_unlink (tmpl);
+            g_free (tmpl);
+            preview_video_frame_path = NULL;
+        }
+        else
+            preview_video_frame_path = tmpl;
+    }
+    else
+    {
+        g_free (tmpl);
+        preview_video_stream_stop ();
+    }
+}
+
+static void
+preview_generate (const char *path, int width, int height)
+{
+    char *quoted;
+    char cmd[8192];
+    int cell_w, cell_h;
+    int px_w, px_h;
+
+    MC_PTR_FREE (preview_cached_path);
+    MC_PTR_FREE (preview_cached_data);
+    preview_cached_path = g_strdup (path);
+    preview_cached_kind = 0;
+    preview_cached_lines = 0;
+    preview_cached_width = width;
+    preview_cached_height = height;
+
+    preview_cell_pixels (&cell_w, &cell_h);
+    px_w = width * cell_w;
+    px_h = height * cell_h;
+
+    {
+        const char *missing = NULL;
+
+        if (preview_is_image (path))
+        {
+            if (terminal_supports_sixel ())
+            {
+                if (!preview_has ("convert"))
+                    missing = "convert";
+            }
+            else
+            {
+                if (!preview_has ("convert"))
+                    missing = "convert";
+                else if (!preview_has ("jp2a"))
+                    missing = "jp2a";
+            }
+        }
+        else if (preview_is_video (path))
+        {
+            if (terminal_supports_sixel ())
+            {
+                if (!preview_has ("ffprobe"))
+                    missing = "ffprobe";
+                else if (!preview_has ("ffmpeg"))
+                    missing = "ffmpeg";
+                else if (!preview_has ("convert"))
+                    missing = "convert";
+            }
+            else
+            {
+                if (!preview_has ("ffprobe"))
+                    missing = "ffprobe";
+                else if (!preview_has ("ffmpeg"))
+                    missing = "ffmpeg";
+                else if (!preview_has ("jp2a"))
+                    missing = "jp2a";
+            }
+        }
+        else if (preview_is_audio (path))
+        {
+            if (!preview_has ("ffprobe"))
+                missing = "ffprobe";
+        }
+        else if (g_ascii_strcasecmp (strrchr (path, '.') ? strrchr (path, '.') + 1 : "", "zip") == 0)
+        {
+            if (!preview_has ("zipinfo"))
+                missing = "zipinfo";
+        }
+        else if (g_ascii_strcasecmp (strrchr (path, '.') ? strrchr (path, '.') + 1 : "", "pdf") == 0)
+        {
+            if (!preview_has ("pdftotext"))
+                missing = "pdftotext";
+        }
+
+        if (missing != NULL)
+        {
+            char warn[256];
+            g_snprintf (warn, sizeof (warn), "Missing helper app: %s", missing);
+            preview_cached_data = g_strdup (warn);
+            preview_cached_kind = 2;
+            return;
+        }
+    }
+
+    if (preview_is_image (path))
+    {
+        quoted = g_shell_quote (path);
+        if (terminal_supports_sixel ())
+            g_snprintf (cmd, sizeof (cmd),
+                        "convert %s -filter Lanczos -resize %dx%d -background black -gravity center -extent %dx%d sixel:- 2>/dev/null; "
+                        "printf '\\033[?25h'",
+                        quoted, px_w, px_h, px_w, px_h);
+        else
+            g_snprintf (cmd, sizeof (cmd), "convert %s PNG:- 2>/dev/null | jp2a --size=%dx%d - 2>/dev/null", quoted, width, height);
+        g_free (quoted);
+        preview_cached_data = preview_run_command (cmd);
+        if (preview_cached_data != NULL)
+            preview_cached_kind = 1;
+    }
+    else if (preview_is_video (path))
+    {
+        quoted = g_shell_quote (path);
+        if (terminal_supports_sixel ())
+        {
+            if (g_strcmp0 (preview_video_duration_path, path) != 0)
+            {
+                char *dur_str;
+
+                g_snprintf (cmd, sizeof (cmd),
+                            "ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 %s 2>/dev/null",
+                            quoted);
+                dur_str = preview_run_command (cmd);
+                preview_video_duration = (dur_str != NULL) ? g_strtod (dur_str, NULL) : 0.0;
+                g_free (dur_str);
+                g_free (preview_video_duration_path);
+                preview_video_duration_path = g_strdup (path);
+            }
+
+            if (preview_video_duration > 0.0)
+            {
+                // animation frames are produced from the persistent ffmpeg stream
+                preview_cached_data = NULL;
+                preview_cached_kind = 0;
+            }
+            else
+            {
+                // duration unavailable: show a single still frame
+                g_snprintf (cmd, sizeof (cmd),
+                            "ffmpeg -y -i %s -frames:v 1 -f image2pipe -vcodec png - 2>/dev/null | "
+                            "convert - -filter Lanczos -resize %dx%d -background black -gravity center -extent %dx%d sixel:- 2>/dev/null; "
+                            "printf '\\033[?25h'",
+                            quoted, px_w, px_h, px_w, px_h);
+                preview_cached_data = preview_run_command (cmd);
+                if (preview_cached_data != NULL)
+                    preview_cached_kind = 1;
+            }
+        }
+        else
+        {
+            g_snprintf (cmd, sizeof (cmd),
+                        "ffmpeg -y -i %s -frames:v 1 -f image2pipe -vcodec png - 2>/dev/null | "
+                        "jp2a --size=%dx%d - 2>/dev/null",
+                        quoted, width, height);
+            preview_cached_data = preview_run_command (cmd);
+            if (preview_cached_data != NULL)
+                preview_cached_kind = 1;
+        }
+        g_free (quoted);
+    }
+    else if (preview_is_audio (path))
+    {
+        quoted = g_shell_quote (path);
+        g_snprintf (cmd, sizeof (cmd),
+                    "ffprobe -v error -show_entries format=duration:format_tags=title,artist,album -of default=noprint_wrappers=1 %s 2>/dev/null",
+                    quoted);
+        g_free (quoted);
+        preview_cached_data = preview_run_command (cmd);
+        if (preview_cached_data != NULL)
+            preview_cached_kind = 2;
+    }
+    else if (g_ascii_strcasecmp (strrchr (path, '.') ? strrchr (path, '.') + 1 : "", "zip") == 0)
+    {
+        quoted = g_shell_quote (path);
+        g_snprintf (cmd, sizeof (cmd), "zipinfo -1 %s 2>/dev/null | head -n 10", quoted);
+        g_free (quoted);
+        preview_cached_data = preview_run_command (cmd);
+        if (preview_cached_data != NULL)
+            preview_cached_kind = 2;
+    }
+    else if (g_ascii_strcasecmp (strrchr (path, '.') ? strrchr (path, '.') + 1 : "", "html") == 0
+             || g_ascii_strcasecmp (strrchr (path, '.') ? strrchr (path, '.') + 1 : "", "htm") == 0)
+    {
+        quoted = g_shell_quote (path);
+        g_snprintf (cmd, sizeof (cmd), "sed -n '/<body/,/<\\/body>/p' %s 2>/dev/null | sed 's/<[^>]*>//g' | head -n %d", quoted, height);
+        g_free (quoted);
+        preview_cached_data = preview_run_command (cmd);
+        if (preview_cached_data != NULL)
+            preview_cached_kind = 2;
+    }
+    else
+    {
+        quoted = g_shell_quote (path);
+        if (g_ascii_strcasecmp (strrchr (path, '.') ? strrchr (path, '.') + 1 : "", "pdf") == 0)
+            g_snprintf (cmd, sizeof (cmd), "pdftotext -layout %s - 2>/dev/null | head -n %d", quoted, height);
+        else
+            g_snprintf (cmd, sizeof (cmd), "head -n %d %s 2>/dev/null", height, quoted);
+        g_free (quoted);
+        preview_cached_data = preview_run_command (cmd);
+        if (preview_cached_data != NULL)
+        {
+            preview_cached_kind = 2;
+            // count lines
+            char *p = preview_cached_data;
+            preview_cached_lines = 0;
+            while (p != NULL && *p != '\0' && preview_cached_lines < height)
+            {
+                preview_cached_lines++;
+                p = strchr (p, '\n');
+                if (p != NULL)
+                    p++;
+            }
+        }
+    }
+}
+
+static void
+preview_video_hook (void *data)
+{
+    WPanel *source_panel;
+    const file_entry_t *fe;
+    char *path;
+    vfs_path_t *vpath;
+    gint64 now;
+
+    (void) data;
+
+    if (!is_idle ())
+    {
+        if (!hook_present (idle_hook, preview_video_hook))
+            add_hook (&idle_hook, preview_video_hook, NULL);
+        return;
+    }
+
+    source_panel = (left_panel != NULL) ? left_panel : right_panel;
+    if (source_panel == NULL || right_panel == NULL)
+        return;
+
+    fe = panel_current_entry (source_panel);
+    if (fe == NULL || !preview_is_video (fe->fname->str) || preview_video_stream == NULL)
+    {
+        delete_hook (&idle_hook, preview_video_hook);
+        preview_video_stream_stop ();
+        preview_animating = FALSE;
+        return;
+    }
+
+    vpath = vfs_path_append_new (source_panel->cwd_vpath, fe->fname->str, (char *) NULL);
+    path = vfs_path_to_str_flags (vpath, 0, VPF_NONE);
+
+    if (preview_cached_path == NULL || strcmp (preview_cached_path, path) != 0)
+    {
+        // selection changed; reset handled in preview_render
+        vfs_path_free (vpath, TRUE);
+        g_free (path);
+        return;
+    }
+
+    now = g_get_monotonic_time ();
+    if (preview_last_frame_time != 0
+        && (now - preview_last_frame_time) < (gint64) (1000000.0 / PREVIEW_VIDEO_FPS))
+    {
+        vfs_path_free (vpath, TRUE);
+        g_free (path);
+        return;
+    }
+
+    if (preview_video_stream_frame_bytes > 0 && preview_video_frame_buf != NULL
+        && preview_video_frame_fd >= 0)
+    {
+        size_t n = fread (preview_video_frame_buf, 1, preview_video_stream_frame_bytes,
+                          preview_video_stream);
+
+        if (n == (size_t) preview_video_stream_frame_bytes
+            && preview_video_frame_write (preview_video_frame_buf,
+                                          preview_video_stream_frame_bytes))
+        {
+            char size_arg[32];
+            char *file_arg;
+            char *argv[8];
+
+            preview_video_current_ts = (double) preview_video_stream_frames * PREVIEW_VIDEO_SPEED
+                / PREVIEW_VIDEO_FPS;
+            while (preview_video_duration > 0.0 && preview_video_current_ts >= preview_video_duration)
+                preview_video_current_ts -= preview_video_duration;
+            preview_video_stream_frames++;
+
+            g_snprintf (size_arg, sizeof (size_arg), "%dx%d", preview_video_stream_w,
+                        preview_video_stream_h);
+            if (preview_video_frame_path != NULL)
+                file_arg = g_strdup_printf ("rgb:%s", preview_video_frame_path);
+            else
+                file_arg = g_strdup_printf ("rgb:/proc/self/fd/%d", preview_video_frame_fd);
+            argv[0] = "convert";
+            argv[1] = "-size";
+            argv[2] = size_arg;
+            argv[3] = "-depth";
+            argv[4] = "8";
+            argv[5] = file_arg;
+            argv[6] = "sixel:-";
+            argv[7] = NULL;
+
+            MC_PTR_FREE (preview_cached_data);
+            preview_cached_data = preview_run_argv (argv);
+            preview_cached_kind = 1;
+            g_free (file_arg);
+
+            preview_last_frame_time = now;
+            mc_refresh ();
+        }
+        else
+        {
+            preview_video_stream_failed = TRUE;
+            preview_video_stream_stop ();
+            preview_animating = FALSE;
+        }
+    }
+    else
+    {
+        preview_video_stream_failed = TRUE;
+        preview_video_stream_stop ();
+        preview_animating = FALSE;
+    }
+
+    vfs_path_free (vpath, TRUE);
+    g_free (path);
+}
+
+gboolean
+preview_is_animating (void)
+{
+    return preview_animating;
+}
+
+void
+preview_toggle (void)
+{
+    preview_enabled = !preview_enabled;
+
+    if (!preview_enabled)
+    {
+        preview_video_stream_stop ();
+        preview_animating = FALSE;
+    }
+    else
+        preview_video_stream_failed = FALSE;
+
+    mc_refresh ();
+}
+
+static void
+preview_restore_panel (void)
+{
+    Widget *w;
+
+    if (!preview_overlay_active || right_panel == NULL)
+        return;
+
+    w = WIDGET (right_panel);
+    preview_overlay_active = FALSE;
+
+    if (widget_get_state (w, WST_VISIBLE))
+    {
+        int preview_h = w->rect.lines / 3;
+        int preview_y = w->rect.y + w->rect.lines - preview_h;
+
+        // bypass widget_draw(): the panel's owner group may not be active
+        w->callback (w, NULL, MSG_DRAW, 0, NULL);
+
+        // the preview was drawn directly, outside S-Lang's virtual screen;
+        // force the restored cells to be emitted on the next refresh
+        if (preview_h > 0)
+            SLsmg_touch_lines (preview_y, (unsigned int) preview_h);
+        tty_refresh ();
+    }
+}
+
+static void
+preview_video_caption (const char *fname, int width, double duration, double ts,
+                       char *caption, size_t caption_size, int *bar_offset, int *bar_width)
+{
+    char time_full[64];
+    char time_short[64];
+    char pctbuf[32];
+    char bar[512];
+    const char *time_str;
+    int fname_len = (int) strlen (fname);
+    int fname_used;
+    int time_len;
+    int pct_len;
+    int overhead;
+    int total_sec = (int) duration;
+    int cur_sec = (int) ts;
+    int pct = (total_sec > 0) ? (int) (ts / duration * 100.0) : 0;
+    int include_pct = 1;
+    int filled;
+    int i;
+
+    g_snprintf (time_full, sizeof (time_full), "%02d:%02d/%02d:%02d",
+                cur_sec / 60, cur_sec % 60, total_sec / 60, total_sec % 60);
+    g_snprintf (time_short, sizeof (time_short), "%02d:%02d", cur_sec / 60, cur_sec % 60);
+    g_snprintf (pctbuf, sizeof (pctbuf), "%d%%", pct);
+    pct_len = (int) strlen (pctbuf);
+
+    // prefer the fullest caption that still leaves a reasonably long bar
+    time_str = time_full;
+    time_len = (int) strlen (time_str);
+    overhead = time_len + pct_len + 5;
+    *bar_width = width - overhead - fname_len;
+
+    if (*bar_width < PREVIEW_VIDEO_BAR_MIN)
+    {
+        time_str = time_short;
+        time_len = (int) strlen (time_str);
+        overhead = time_len + pct_len + 5;
+        *bar_width = width - overhead - fname_len;
+    }
+
+    if (*bar_width < PREVIEW_VIDEO_BAR_MIN)
+    {
+        include_pct = 0;
+        overhead = time_len + 4;
+        *bar_width = width - overhead - fname_len;
+    }
+
+    fname_used = fname_len;
+    if (fname_used > width - overhead - PREVIEW_VIDEO_BAR_MIN)
+        fname_used = width - overhead - PREVIEW_VIDEO_BAR_MIN;
+    if (fname_used < 0)
+        fname_used = 0;
+
+    *bar_width = width - overhead - fname_used;
+    if (*bar_width < 1)
+        *bar_width = 1;
+    if (*bar_width > (int) sizeof (bar) - 1)
+        *bar_width = (int) sizeof (bar) - 1;
+
+    filled = (*bar_width * pct) / 100;
+    for (i = 0; i < *bar_width; i++)
+    {
+        if (i < filled)
+            bar[i] = '=';
+        else if (i == filled && filled < *bar_width)
+            bar[i] = '>';
+        else
+            bar[i] = ' ';
+    }
+    bar[*bar_width] = '\0';
+
+    if (include_pct)
+        g_snprintf (caption, caption_size, "%.*s %s [%s] %s",
+                    fname_used, fname, time_str, bar, pctbuf);
+    else
+        g_snprintf (caption, caption_size, "%.*s %s [%s]",
+                    fname_used, fname, time_str, bar);
+    *bar_offset = fname_used + time_len + 3;
+}
+
+void
+preview_render (void)
+{
+    WPanel *panel;
+    WPanel *source_panel;
+    Widget *w;
+    const file_entry_t *fe;
+    vfs_path_t *vpath;
+    char *path;
+    int width;
+    int height;
+    int x, y;
+    int i;
+
+    if (right_panel == NULL)
+        return;
+
+    if (!preview_enabled)
+    {
+        preview_video_stream_stop ();
+        preview_animating = FALSE;
+        preview_restore_panel ();
+        return;
+    }
+
+    panel = right_panel;
+    source_panel = (left_panel != NULL) ? left_panel : right_panel;
+    w = WIDGET (panel);
+    if (!widget_get_state (w, WST_VISIBLE))
+        return;
+
+    fe = panel_current_entry (source_panel);
+    if (fe == NULL)
+    {
+        preview_restore_panel ();
+        return;
+    }
+
+    if (!preview_is_supported (fe->fname->str))
+    {
+        preview_video_stream_stop ();
+        preview_animating = FALSE;
+        preview_restore_panel ();
+        return;
+    }
+
+    {
+        int outer_w, outer_h, outer_x, outer_y;
+        int i;
+
+        width = w->rect.cols - 4;
+        height = w->rect.lines / 3 - 3;  // preview occupies the bottom third
+        if (width < 10 || height < 1)
+        {
+            preview_restore_panel ();
+            return;
+        }
+
+        outer_w = width + 2;
+        outer_h = height + 3;  // image + caption + borders
+        outer_x = w->rect.x + (w->rect.cols - outer_w) / 2;
+        outer_y = w->rect.y + w->rect.lines - outer_h;
+
+        x = outer_x + 1;
+        y = outer_y + 1;
+
+        // draw border around the preview pane
+        SLtt_goto_rc (outer_y, outer_x);
+        SLtt_write_string ("+");
+        for (i = 0; i < outer_w - 2; i++)
+            SLtt_write_string ("-");
+        SLtt_write_string ("x");
+        SLtt_goto_rc (outer_y + outer_h - 1, outer_x);
+        SLtt_write_string ("+");
+        for (i = 0; i < outer_w - 2; i++)
+            SLtt_write_string ("-");
+        SLtt_write_string ("+");
+        for (i = 1; i < outer_h - 1; i++)
+        {
+            SLtt_goto_rc (outer_y + i, outer_x);
+            SLtt_write_string ("|");
+            SLtt_goto_rc (outer_y + i, outer_x + outer_w - 1);
+            SLtt_write_string ("|");
+        }
+    }
+
+    vpath = vfs_path_append_new (source_panel->cwd_vpath, fe->fname->str, (char *) NULL);
+    path = vfs_path_to_str_flags (vpath, 0, VPF_NONE);
+
+    {
+        gboolean new_selection = (preview_cached_path == NULL || strcmp (preview_cached_path, path) != 0
+                                  || preview_cached_width != width || preview_cached_height != height);
+        if (new_selection)
+            preview_generate (path, width, height);
+
+        if (preview_is_video (fe->fname->str) && terminal_supports_sixel ()
+            && preview_video_duration > 0.0)
+        {
+            if (new_selection || (preview_video_stream == NULL && !preview_video_stream_failed))
+            {
+                int cell_w, cell_h;
+
+                if (new_selection)
+                    preview_video_stream_failed = FALSE;
+                preview_cell_pixels (&cell_w, &cell_h);
+                preview_video_stream_start (path, width * cell_w, height * cell_h, 0.0);
+                preview_video_current_ts = 0.0;
+                preview_last_frame_time = 0;
+                preview_animating = TRUE;
+            }
+            if (!hook_present (idle_hook, preview_video_hook))
+                add_hook (&idle_hook, preview_video_hook, NULL);
+        }
+        else
+        {
+            if (preview_animating || preview_video_stream != NULL)
+            {
+                delete_hook (&idle_hook, preview_video_hook);
+                preview_video_stream_stop ();
+                preview_animating = FALSE;
+            }
+        }
+    }
+
+    vfs_path_free (vpath, TRUE);
+    g_free (path);
+
+    // hide the cursor while redrawing to reduce flicker
+    SLtt_set_cursor_visibility (0);
+
+    // clear region
+    for (i = 0; i < height; i++)
+    {
+        SLtt_goto_rc (y + i, x);
+        {
+            char spaces[256];
+            int j;
+            for (j = 0; j < width && j < (int) sizeof (spaces) - 1; j++)
+                spaces[j] = ' ';
+            spaces[j] = '\0';
+            SLtt_write_string (spaces);
+        }
+    }
+
+    if (preview_cached_kind == 1 && preview_cached_data != NULL)
+    {
+        SLtt_goto_rc (y, x);
+        SLtt_write_string (preview_cached_data);
+    }
+    else if (preview_cached_kind == 2 && preview_cached_data != NULL)
+    {
+        char *p = preview_cached_data;
+        char line[512];
+        int row = 0;
+        while (row < height && p != NULL && *p != '\0')
+        {
+            char *nl = strchr (p, '\n');
+            size_t len;
+            int j, outpos = 0;
+
+            if (nl != NULL)
+                len = (size_t) (nl - p);
+            else
+                len = strlen (p);
+            if (len > sizeof (line) - 1)
+                len = sizeof (line) - 1;
+            memcpy (line, p, len);
+            line[len] = '\0';
+
+            SLtt_goto_rc (y + row, x);
+            // sanitize
+            for (j = 0; line[j] != '\0' && outpos < width; j++)
+            {
+                unsigned char c = (unsigned char) line[j];
+                if (c == '\t')
+                    c = ' ';
+                if (c < 32 || c == 127)
+                    c = '.';
+                // crude: write char
+                {
+                    char tmp[2] = { (char) c, '\0' };
+                    SLtt_write_string (tmp);
+                }
+                outpos++;
+            }
+            // pad
+            while (outpos < width)
+            {
+                SLtt_write_string (" ");
+                outpos++;
+            }
+            row++;
+
+            if (nl != NULL)
+                p = nl + 1;
+            else
+                break;
+        }
+        // fill remaining rows
+        while (row < height)
+        {
+            int k;
+            SLtt_goto_rc (y + row, x);
+            for (k = 0; k < width; k++)
+                SLtt_write_string (" ");
+            row++;
+        }
+    }
+
+    // draw the file name as a caption at the bottom of the preview pane
+    if (fe != NULL)
+    {
+        char caption[512];
+        int pos = 0;
+
+        if (preview_is_video (fe->fname->str) && terminal_supports_sixel ())
+        {
+            int bar_offset, bar_width;
+
+            preview_video_caption (fe->fname->str, width, preview_video_duration,
+                                   preview_video_current_ts, caption, sizeof (caption),
+                                   &bar_offset, &bar_width);
+        }
+        else
+            g_snprintf (caption, sizeof (caption), "%s", fe->fname->str);
+
+        SLtt_goto_rc (y + height, x);
+        for (i = 0; i < width && caption[i] != '\0'; i++)
+        {
+            char tmp[2] = { caption[i], '\0' };
+            SLtt_write_string (tmp);
+        }
+        for (; i < width; i++)
+            SLtt_write_string ("-");
+    }
+
+    preview_overlay_active = TRUE;
+    SLtt_set_cursor_visibility (1);
+    SLtt_flush_output ();
+}
+
+/* --------------------------------------------------------------------------------------------- */
 
 static cb_ret_t
 panel_callback (Widget *w, Widget *sender, widget_msg_t msg, int parm, void *data)
@@ -3772,6 +4824,8 @@ panel_callback (Widget *w, Widget *sender, widget_msg_t msg, int parm, void *dat
 
     case MSG_DRAW:
         // Repaint everything, including frame and separator
+        if (panel == right_panel)
+            preview_overlay_active = FALSE;
         widget_erase (w);
         show_dir (panel);
         panel_print_header (panel);
@@ -4010,6 +5064,93 @@ panel_mouse_callback (Widget *w, mouse_msg_t msg, mouse_event_t *event)
     switch (msg)
     {
     case MSG_MOUSE_DOWN:
+        if (the_cmdline != NULL)
+            input_clean (the_cmdline);
+
+        if (panel == right_panel && preview_is_video (panel_current_entry ((left_panel != NULL) ? left_panel : right_panel)->fname->str)
+            && terminal_supports_sixel ())
+        {
+            WPanel *source_panel = (left_panel != NULL) ? left_panel : right_panel;
+            const file_entry_t *sfe = panel_current_entry (source_panel);
+            int outer_w, outer_h, outer_x, outer_y;
+            int width, height;
+            int progress_row;
+            int bar_x, bar_end;
+            int bar_offset, bar_width;
+            int rel_x;
+            int pct;
+            char caption[512];
+
+            outer_w = w->rect.cols - 2;
+            outer_h = w->rect.lines / 3;
+            outer_x = 1;
+            outer_y = w->rect.lines - outer_h;
+            width = outer_w - 2;
+            height = outer_h - 3;
+            progress_row = w->rect.lines - 2;  // caption/progress row, above the bottom border
+
+            if (event->y == outer_y && event->x == outer_x + outer_w - 1)
+            {
+                preview_toggle ();
+                event->result.abort = TRUE;
+                panel->dirty = FALSE;
+                return;
+            }
+
+            if (event->y >= outer_y)
+            {
+                // locate the [====>    ] bar inside the caption row
+                preview_video_caption (sfe->fname->str, width, preview_video_duration,
+                                       preview_video_current_ts, caption, sizeof (caption),
+                                       &bar_offset, &bar_width);
+                bar_x = outer_x + 1 + bar_offset;
+                bar_end = bar_x + bar_width;
+
+                if (bar_x < outer_x + 1)
+                    bar_x = outer_x + 1;
+                if (bar_end > outer_x + 1 + width)
+                    bar_end = outer_x + 1 + width;
+
+                if (event->y == progress_row && bar_end > bar_x
+                    && event->x >= bar_x && event->x < bar_end)
+                {
+                    rel_x = event->x - bar_x;
+                    pct = (bar_end - bar_x > 1) ? (rel_x * 100) / (bar_end - bar_x - 1) : 0;
+
+                    if (preview_video_duration > 0.0)
+                    {
+                        char *vpath_str;
+                        vfs_path_t *vpath;
+                        int cell_w, cell_h;
+
+                        preview_video_current_ts = preview_video_duration * pct / 100.0;
+                        preview_video_stream_failed = FALSE;
+                        vpath = vfs_path_append_new (source_panel->cwd_vpath, sfe->fname->str, (char *) NULL);
+                        vpath_str = vfs_path_to_str_flags (vpath, 0, VPF_NONE);
+                        preview_cell_pixels (&cell_w, &cell_h);
+                        preview_video_stream_start (vpath_str, width * cell_w, height * cell_h,
+                                                    preview_video_current_ts);
+                        preview_last_frame_time = 0;
+                        vfs_path_free (vpath, TRUE);
+                        g_free (vpath_str);
+                        mc_refresh ();
+                    }
+
+                    // prevent default handling
+                    event->result.abort = FALSE;
+                    panel->dirty = FALSE;
+                    return;
+                }
+
+                // consume any click in the preview pane to avoid leaking escape codes
+                if (the_cmdline != NULL)
+                    input_clean (the_cmdline);
+                event->result.abort = TRUE;
+                panel->dirty = FALSE;
+                return;
+            }
+        }
+
         if (event->y == 0)
         {
             // top frame
@@ -4754,6 +5895,8 @@ select_item (WPanel *panel)
     panel->dirty = TRUE;
 
     execute_hooks (select_file_hook);
+
+    mc_refresh ();
 }
 
 /* --------------------------------------------------------------------------------------------- */

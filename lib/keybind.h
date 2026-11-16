@@ -127,6 +127,7 @@ enum
     CK_Bookmark,
     CK_Quit,
     CK_QuitQuiet,
+    CK_TogglePreview,
     // C-x or similar
     CK_ExtendedKeyMap,
 

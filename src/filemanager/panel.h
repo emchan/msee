@@ -199,6 +199,11 @@ void panel_panelize_save (WPanel *panel);
 void panel_init (void);
 void panel_deinit (void);
 
+void preview_render (void);
+gboolean preview_is_animating (void);
+extern gboolean preview_enabled;
+void preview_toggle (void);
+
 /* --------------------------------------------------------------------------------------------- */
 /*** inline functions ****************************************************************************/
 /* --------------------------------------------------------------------------------------------- */

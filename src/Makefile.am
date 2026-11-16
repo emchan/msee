@@ -35,7 +35,7 @@ endif
 
 AM_CPPFLAGS += -I$(top_srcdir) $(GLIB_CFLAGS)
 
-bin_PROGRAMS = mc
+bin_PROGRAMS = msee
 
 if USE_INTERNAL_EDIT
 EDITLIB = editor/libedit.la
@@ -55,14 +55,14 @@ libinternal_la_LIBADD = \
 	viewer/libmcviewer.la \
 	$(DIFFLIB) $(EDITLIB) $(SUBSHELLLIB)
 
-mc_LDADD = \
+msee_LDADD = \
 	libinternal.la \
 	$(top_builddir)/lib/libmc.la
 
 SRC_mc_conssaver = \
 	cons.handler.c consaver/cons.saver.h
 
-mc_SOURCES = \
+msee_SOURCES = \
 	main.c
 
 libinternal_la_SOURCES = \
@@ -91,6 +91,7 @@ EXTRA_DIST = $(SRC_maintainer) $(SRC_charset)
 # end of automated testing
 
 install-exec-hook:
+	$(MAKE) install_mc
 	$(MAKE) install_mcview
 if USE_INTERNAL_EDIT
 	$(MAKE) install_mcedit
@@ -102,14 +103,17 @@ endif
 #
 # Make relative symlinks, but do the right thing if LN_S is `ln' or `cp'.
 #
+install_mc:
+	cd $(DESTDIR)$(bindir)/$(binprefix) && rm -f mc && $(LN_S) msee mc
+
 install_mcview:
-	cd $(DESTDIR)$(bindir)/$(binprefix) && rm -f mcview && $(LN_S) mc mcview
+	cd $(DESTDIR)$(bindir)/$(binprefix) && rm -f mcview && $(LN_S) msee mcview
 
 install_mcedit:
-	cd $(DESTDIR)$(bindir)/$(binprefix) && rm -f mcedit && $(LN_S) mc mcedit
+	cd $(DESTDIR)$(bindir)/$(binprefix) && rm -f mcedit && $(LN_S) msee mcedit
 
 install_mcdiff:
-	cd $(DESTDIR)$(bindir)/$(binprefix) && rm -f mcdiff && $(LN_S) mc mcdiff
+	cd $(DESTDIR)$(bindir)/$(binprefix) && rm -f mcdiff && $(LN_S) msee mcdiff
 
 uninstall-hook:
 	rm -f $(DESTDIR)$(bindir)/$(binprefix)/mcview

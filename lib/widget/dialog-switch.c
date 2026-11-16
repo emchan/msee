@@ -35,6 +35,7 @@
 #include "lib/global.h"
 #include "lib/tty/tty.h"  // LINES, COLS
 #include "lib/widget.h"
+#include "src/filemanager/panel.h"
 #include "lib/event.h"
 
 /*** global variables ****************************************************************************/
@@ -356,6 +357,7 @@ repaint_screen (void)
 {
     do_refresh ();
     tty_refresh ();
+    preview_render ();
 }
 
 /* --------------------------------------------------------------------------------------------- */
@@ -369,12 +371,16 @@ mc_refresh (void)
 #endif
 
     if (!tty_got_winch ())
+    {
         tty_refresh ();
+        preview_render ();
+    }
     else
     {
         /* if winch was caugth, we should do not only redraw screen, but
            reposition/resize all */
         dialog_change_screen_size ();
+        preview_render ();
     }
 }
 
