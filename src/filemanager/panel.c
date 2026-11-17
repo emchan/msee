@@ -4213,7 +4213,7 @@ preview_generate (const char *path, int width, int height)
         g_free (quoted);
         preview_cached_data = preview_run_command (cmd);
         if (preview_cached_data != NULL)
-            preview_cached_kind = 1;
+            preview_cached_kind = terminal_supports_sixel() ? 1 : 2;
     }
     else if (preview_is_video (path))
     {
@@ -4261,7 +4261,7 @@ preview_generate (const char *path, int width, int height)
                         quoted, width, height);
             preview_cached_data = preview_run_command (cmd);
             if (preview_cached_data != NULL)
-                preview_cached_kind = 1;
+                preview_cached_kind = terminal_supports_sixel() ? 1 : 2;
         }
         g_free (quoted);
     }
