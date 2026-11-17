@@ -20,6 +20,11 @@ panel using **sixel** graphics, so they work in sixel-capable terminals such as
   centered with ImageMagick, with unused space filled by a background colour.
 - Preview tracks the selection of the left panel, updating as you navigate.
 
+## Quick start in a Docker sandbox with Windows Terminal and Powershell
+```
+docker run -it --rm -e WT_SESSION="$env:WT_SESSION" -v "$($PWD.Path):/content" -w /content ubuntu bash -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git build-essential autoconf automake autopoint gettext libtool pkg-config libglib2.0-dev libncurses-dev imagemagick ffmpeg poppler-utils libslang2-dev unzip jp2a chafa libheif-plugin-libde265 && git clone --depth 1 https://github.com/emchan/msee /opt/msee && cd /opt/msee && ./autogen.sh && ./configure --prefix=/usr/local && make -j"$(nproc)" && make install && cd /content && exec msee /content'
+```
+
 ## Building
 
 ```sh
