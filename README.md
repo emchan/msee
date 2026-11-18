@@ -6,6 +6,8 @@ previewer.  Previews are rendered inside a bordered pane in the lower third of t
 panel using **sixel** graphics, so they work in sixel-capable terminals such as
 **Windows Terminal**.
 
+![msee previewing a PNG file in the integrated sixel preview pane](msee.png)
+
 ## Features added on top of Midnight Commander
 
 - **Preview pane** in the lower third of the right panel, surrounded by a border, with the
